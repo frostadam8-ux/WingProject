@@ -3,7 +3,9 @@
 """
 Created on Tue Nov  3 22:26:23 2026
 
-@author: admin
+@author: frostadam8-ux
+
+github repository: https://github.com/frostadam8-ux/WingProject.git
 """
 
 import sys
@@ -15,7 +17,7 @@ import matplotlib.pyplot as plt
 DEBUG = True
 AL0 = 0
 ETAD = 1.0
-INPUT_FILE = 'W3_input.json'
+INPUT_FILE = 'input.json'
 
 # decided to go about loading this .json in a different way so the wing info can be an object
 class WingInput:
@@ -30,16 +32,14 @@ class WingInput:
         self.planform_type = planform["type"].lower()
         self.aspect_ratio = planform["aspect_ratio"]
         self.taper_ratio = None
-        if self.planform_type == "tapered":
-            self.taper_ratio = planform["taper_ratio"]
-        elif self.planform_type != "elliptic":
-            # error if given type other than tapered or elliptic
-            raise ValueError(f"Unknown planform type: {self.planform_type}")
+        self.planform_file = planform["filename"]
         # other stuff
         self.airfoil_lift_slope = wing["airfoil_lift_slope"]
         self.nodes_per_semispan = wing["nodes_per_semispan"]
         self.alpha_root_deg = data["condition"]["alpha_root[deg]"]
-        self.alpha_root_rad = math.radians(self.alpha_root_deg)
+        if self.alpha_root_deg != "CL":
+            self.alpha_root_rad = math.radians(self.alpha_root_deg)
+        self.CL = data["condition"]["CL"]
         self.ail_deflection_deg = data["condition"]["aileron_deflection[deg]"]
         self.ail_deflection_rad = math.radians(self.ail_deflection_deg)
         self.pbar = data["condition"]["pbar"]
@@ -59,13 +59,34 @@ class WingInput:
         self.view_planform = data["view"]["planform"]
         self.view_washout_distribution = data["view"]["washout_distribution"]
         self.view_aileron_distribution = data["view"]["aileron_distribution"]
+        self.view_CL_hat_distributions = data["view"]["CL_hat_distributions"]
+        self.view_CL_tilde_distributions = data["view"]["CL_tilde_distributions"]
 
-def calc_cb(wing, zb):
+def get_nodes_from_geom(geometry):
+    with open(geometry, "r") as f:
+        info = []
+        for line in f:
+            try:
+                info.append([float(coordinate) for coordinate in line.split()])
+            except ValueError:
+                continue
+    # now make the info list a numpy array 
+    nodes = np.array(info)
+    mirror = nodes.copy()[1:,:]
+    mirror[:,0] *= -1
+    nodes = np.vstack((np.flip(mirror,axis=0), nodes))
+    nodes[:,1] = np.maximum(nodes[:,1], 0.001)
+    RA = 1/np.trapezoid(nodes[:,1],nodes[:,0])
+    return nodes, RA
+
+def calc_cb(wing, planform, zb):
     # get cb using tapered/elliptic numbers
     if wing.planform_type == 'tapered':
         cb = 2/(wing.aspect_ratio*(1+wing.taper_ratio)) * (1-(1-wing.taper_ratio)*np.abs(2*zb))
     elif wing.planform_type == 'elliptic':
         cb = 4/(np.pi*wing.aspect_ratio) * np.sqrt(1 - (2*zb)**2)
+    elif wing.planform_type == 'file':
+        cb = np.interp(zb, planform[:,0], planform[:,1])
     else:
         return 0
     return cb
@@ -153,123 +174,136 @@ def plot_ail_distribution(zb, chi):
     ax.set_title('Aileron Distribution')
     plt.show()
     
-#%% W3 warmup
-# grab object for the input .json
-wing = WingInput(INPUT_FILE)
-# set up nodes (subtract one after doubling)
-N = wing.nodes_per_semispan*2 - 1
-theta = np.linspace(0, np.pi, N)
-j = np.arange(1, N+1)
-# get zb using cosine clustering
-zb = -0.5 + 0.5*(1-np.cos(theta))
-zb[np.abs(zb) < 1e-15] = 0
-# outsource cb to function so can use for aileron too
-cb = calc_cb(wing, zb)
-cb[np.abs(cb) < 1e-15] = 0
-# get c, cinv, and an
-C = calc_c(N, wing.airfoil_lift_slope, cb, theta)
-C[np.abs(C) < 1e-15] = 0
-Cinv = np.linalg.inv(C)
-an = np.linalg.solve(C,np.full(N, 1))
-# get bn
-if wing.washout_type == 'linear':
-    omega = np.abs(np.cos(theta))
-elif wing.washout_type == 'optimum':
-    if wing.planform_type == 'tapered':
-        omega = 1 - np.sin(theta)/(1 - (1 - wing.taper_ratio)*np.abs(np.cos(theta)))
-    else:   
-        # elliptic is already optimal
+def clean(x, tol=1e-15):
+    # helper function for final print to print zeros as zeros
+    return 0.0 if abs(x) < tol else x
+    
+#%% main
+if __name__ == "__main__":
+    # grab object for the input .json
+    wing = WingInput(INPUT_FILE)
+    # get geometry if necessary
+    if wing.planform_type == 'file':
+        planform, RA = get_nodes_from_geom(wing.planform_file)
+    else:
+        planform, RA = None, wing.aspect_ratio
+    # set up nodes (subtract one after doubling)
+    N = wing.nodes_per_semispan*2 - 1
+    theta = np.linspace(0, np.pi, N)
+    j = np.arange(1, N+1)
+    # get zb using cosine clustering
+    zb = -0.5 + 0.5*(1-np.cos(theta))
+    zb[np.abs(zb) < 1e-15] = 0
+    # outsource cb to function so can use for aileron too
+    cb = calc_cb(wing, planform, zb)
+    cb[np.abs(cb) < 1e-15] = 0
+    # get c, cinv, and an
+    C = calc_c(N, wing.airfoil_lift_slope, cb, theta)
+    C[np.abs(C) < 1e-15] = 0
+    Cinv = np.linalg.inv(C)
+    an = np.linalg.solve(C,np.full(N, 1))
+    # get bn
+    if wing.washout_type == 'linear':
+        omega = np.abs(np.cos(theta))
+    elif wing.washout_type == 'optimum':
+        if wing.planform_type == 'elliptic':
+            # elliptic optimum washout is none
+            omega = np.zeros(N)
+        else:
+            omega = 1 - np.sin(theta)/(cb/calc_cb(wing, planform, 0.0))
+    else:
         omega = np.zeros(N)
-else:
-    # if there isn't any washout, omega as zeros behaves the same
-    omega = np.zeros(N)
-# get bn
-bn = np.linalg.solve(C, omega)
-bn[np.abs(bn) < 1e-15] = 0
-# get aileron stuff starting with cf/c
-hinge_start = calc_cb(wing, wing.ail_zb_start)*(wing.ail_cfc_start - 0.75)
-hinge_end = calc_cb(wing, wing.ail_zb_end)*(wing.ail_cfc_end - 0.75)
-cfc = np.zeros(N)
-# do some numpy magic to handle the start/end cases
-on = (np.abs(zb) >= wing.ail_zb_start) & (np.abs(zb) <= wing.ail_zb_end)
-hinge = hinge_start + (hinge_end - hinge_start)*(np.abs(zb[on]) - wing.ail_zb_start)/(wing.ail_zb_end - wing.ail_zb_start)
-cfc[on] = hinge/cb[on] + 0.75
-# now for thetaf, epsfi, and epsf
-thetaf = np.arccos(2*cfc - 1)
-epsfi = 1 - (thetaf - np.sin(thetaf))/np.pi
-epsf = wing.ail_hinge_eff * ETAD * epsfi
-# now on to chi
-chi = np.zeros(N)
-chi[on] = epsf[on]
-chi[zb>0] = -chi[zb>0]
-# then that gives us cn
-cn = np.linalg.solve(C, chi)
-cn[np.abs(cn) < 1e-15] = 0
-# and we'll grab dn too
-dn = np.linalg.solve(C, np.cos(theta))
-#%% get coefficients
-kL = (1-(1+np.pi*wing.aspect_ratio/wing.airfoil_lift_slope)*an[0])/((1+np.pi*wing.aspect_ratio/wing.airfoil_lift_slope)*an[0])
-kD = np.sum([(n+1)*(an[n]/an[0])**2 for n in range(1,N)])
-epO = bn[0]/an[0]
-if bn[0]:
-    kDL = 2 * (bn[0]/an[0]) * np.sum([(n+1)*(an[n]/an[0])*((bn[n]/bn[0])-(an[n]/an[0])) for n in range(1,N)])
-    kDO = (bn[0]/an[0])**2 * np.sum([(n+1)*((bn[n]/bn[0])-(an[n]/an[0]))**2 for n in range(1,N)])
-else:
-    kDL = kDO = 0
-CLa = wing.airfoil_lift_slope/((1+wing.airfoil_lift_slope/(np.pi*wing.aspect_ratio))*(1+kL))
-# deal with washout amount
-if wing.washout_amount_deg == 'optimum':
-    Omega = kDL*wing.CL_design/(2*kDO*CLa)
-else:
-    Omega = wing.washout_amount_rad
-# deal with roll rate
-Clda = -((np.pi*wing.aspect_ratio)/4)*cn[1]
-Clp = -((np.pi*wing.aspect_ratio)/4)*dn[1]
-if wing.pbar == 'steady':
-    pbar = -(Clda/Clp)*wing.ail_deflection_rad
-else:
-    pbar = math.rad(wing.pbar)
-# then the final boss of fourier coeffs
-An = an*(wing.alpha_root_rad-AL0)-(bn*Omega)+(cn*wing.ail_deflection_rad)+(dn*pbar)    
-# and then we get lift and drag!
-CL = np.pi*wing.aspect_ratio*An[0]
-CDi_no_ail = (CL**2*(1+kD)-(kDL*CL*CLa*Omega)+(kDO*(CLa*Omega)**2))/(np.pi*wing.aspect_ratio)
-CDi = (np.pi*wing.aspect_ratio*np.sum([(n+1)*An[n]**2 for n in range(0,N)])) - ((np.pi*wing.aspect_ratio*pbar)/2)*An[1]
-CLa = wing.airfoil_lift_slope/((1+wing.airfoil_lift_slope/(np.pi*wing.aspect_ratio))*(1+kL))
-sigma = np.sum([(n+1)*(An[n]/An[0])**2 for n in range(1,N)])
-es = 1/(1+sigma)
-Cl = (Clda*wing.ail_deflection_rad)+(Clp*pbar)
-Cn = ((CL/8)*(6*An[1]-pbar)) + (((np.pi*wing.aspect_ratio)/8)*(10*An[1]-pbar)*An[2]) + (((np.pi*wing.aspect_ratio)/4)*np.sum([(2*(n+1)-1)*An[n-1]*An[n] for n in range(3,N)]))
-# output the fourier stuff and coeffs
-write_to_file({
-    "C": C,
-    "C^{-1}": Cinv,
-    "a_n": an.reshape(-1, 1),
-    "b_n": bn.reshape(-1, 1),
-    "c_n": cn.reshape(-1, 1),
-    "d_n": dn.reshape(-1, 1),
-    "A_n": An.reshape(-1, 1)
-    }, 'Solution.txt')
-print(
-      f'kappa_L = {kL}\n'
-      f'kappa_D = {kD}\n'
-      f'epsilon_Omega = {epO}\n'
-      f'kappa_DL = {kDL}\n'
-      f'kappa_DOmega = {kDO}\n'
-      f'C_L,a = {CLa}\n'
-      f'e_s = {es}\n\n'
-      f'C_l,da = {Clda}\n'
-      f'C_l,pbar = {Clp}\n'
-      f'C_l = {Cl}\n'
-      f'C_n = {Cn}\n\n'
-      f'C_L = {CL}\n'
-      f'C_Di\' = {CDi_no_ail} (no ail or pbar)\n'
-      f'C_Di = {CDi}'
-      )
-# generate plot of planform and washout
-if wing.view_planform:
-    plot_planform(cb, zb, cfc, wing)
-if wing.view_washout_distribution:
-    plot_washout(zb, omega)
-if wing.view_aileron_distribution:
-    plot_ail_distribution(zb, chi)
+    # get bn
+    bn = np.linalg.solve(C, omega)
+    bn[np.abs(bn) < 1e-15] = 0
+    # get aileron stuff starting with cf/c
+    hinge_start = calc_cb(wing, planform, wing.ail_zb_start)*(wing.ail_cfc_start - 0.75)
+    hinge_end = calc_cb(wing, planform, wing.ail_zb_end)*(wing.ail_cfc_end - 0.75)
+    cfc = np.zeros(N)
+    # do some numpy magic to handle the start/end cases
+    on = (np.abs(zb) >= wing.ail_zb_start) & (np.abs(zb) <= wing.ail_zb_end)
+    hinge = hinge_start + (hinge_end - hinge_start)*(np.abs(zb[on]) - wing.ail_zb_start)/(wing.ail_zb_end - wing.ail_zb_start)
+    cfc[on] = hinge/cb[on] + 0.75
+    # now for thetaf, epsfi, and epsf
+    thetaf = np.arccos(2*cfc - 1)
+    epsfi = 1 - (thetaf - np.sin(thetaf))/np.pi
+    epsf = wing.ail_hinge_eff * ETAD * epsfi
+    # now on to chi
+    chi = np.zeros(N)
+    chi[on] = epsf[on]
+    chi[zb>0] = -chi[zb>0]
+    # then that gives us cn
+    cn = np.linalg.solve(C, chi)
+    cn[np.abs(cn) < 1e-15] = 0
+    # and we'll grab dn too
+    dn = np.linalg.solve(C, np.cos(theta))
+    #%% get coefficients
+    kL = (1-(1+np.pi*RA/wing.airfoil_lift_slope)*an[0])/((1+np.pi*RA/wing.airfoil_lift_slope)*an[0])
+    kD = np.sum([(n+1)*(an[n]/an[0])**2 for n in range(1,N)])
+    epO = bn[0]/an[0]
+    if bn[0]:
+        kDL = 2 * (bn[0]/an[0]) * np.sum([(n+1)*(an[n]/an[0])*((bn[n]/bn[0])-(an[n]/an[0])) for n in range(1,N)])
+        kDO = (bn[0]/an[0])**2 * np.sum([(n+1)*((bn[n]/bn[0])-(an[n]/an[0]))**2 for n in range(1,N)])
+    else:
+        kDL = kDO = 0
+    CLa = wing.airfoil_lift_slope/((1+wing.airfoil_lift_slope/(np.pi*RA))*(1+kL))
+    # deal with washout amount
+    if wing.washout_amount_deg == 'optimum':
+        Omega = kDL*wing.CL_design/(2*kDO*CLa)
+    else:
+        Omega = wing.washout_amount_rad
+    # deal with roll rate
+    Clda = -((np.pi*RA)/4)*cn[1]
+    Clp = -((np.pi*RA)/4)*dn[1]
+    pbar_steady = -(Clda/Clp)*wing.ail_deflection_rad
+    if wing.pbar == 'steady':
+        pbar = pbar_steady
+    else:
+        pbar = wing.pbar
+    # get alpha_root
+    if wing.alpha_root_deg == 'CL':
+        alpha_root_rad = (wing.CL/CLa)+(epO*Omega)+AL0
+    else:
+        alpha_root_rad = math.radians(wing.alpha_root_deg)
+    # then the final boss of fourier coeffs
+    An = an*(alpha_root_rad-AL0)-(bn*Omega)+(cn*wing.ail_deflection_rad)+(dn*pbar)    
+    # and then we get lift and drag!
+    CL = np.pi*RA*An[0]
+    CDi = (np.pi*RA*np.sum([(n+1)*An[n]**2 for n in range(0,N)])) - ((np.pi*RA*pbar)/2)*An[1]
+    CLa = wing.airfoil_lift_slope/((1+wing.airfoil_lift_slope/(np.pi*RA))*(1+kL))
+    sigma = np.sum([(n+1)*(An[n]/An[0])**2 for n in range(1,N)])
+    es = 1/(1+sigma)
+    Cl = (Clda*wing.ail_deflection_rad)+(Clp*pbar)
+    Cn = ((CL/8)*(6*An[1]-pbar)) + (((np.pi*RA)/8)*(10*An[1]-pbar)*An[2]) + (((np.pi*RA)/4)*np.sum([(2*(n+1)-1)*An[n-1]*An[n] for n in range(3,N)]))
+    # output the fourier stuff and coeffs
+    write_to_file({
+        "C": C,
+        "C^{-1}": Cinv,
+        "a_n": an.reshape(-1, 1),
+        "b_n": bn.reshape(-1, 1),
+        "c_n": cn.reshape(-1, 1),
+        "d_n": dn.reshape(-1, 1),
+        "A_n": An.reshape(-1, 1)
+        }, 'Solution.txt')
+    print(
+          f'kappa_L = {clean(kL):.12g}\n'
+          f'C_L,a = {clean(CLa):.12g}\n'
+          f'epsilon_Omega = {clean(epO):.12g}\n'
+          f'kappa_D = {clean(kD):.12g}\n'
+          f'kappa_DL = {clean(kDL):.12g}\n'
+          f'kappa_DOmega = {clean(kDO):.12g}\n\n'
+          f'C_l,da = {clean(Clda):.12g}\n'
+          f'C_l,pbar = {clean(Clp):.12g}\n\n'
+          f'C_L = {clean(CL):.12g}\n'
+          f'C_Di = {clean(CDi):.12g}\n\n'
+          f'C_l = {clean(Cl):.12g}\n'
+          f'C_n = {clean(Cn):.12g}\n'
+          f'pbar_steady = {clean(pbar_steady):.12g}'
+          )
+    # generate plot of planform and washout
+    if wing.view_planform:
+        plot_planform(cb, zb, cfc, wing)
+    if wing.view_washout_distribution:
+        plot_washout(zb, omega)
+    if wing.view_aileron_distribution:
+        plot_ail_distribution(zb, chi)
